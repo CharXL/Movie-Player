@@ -3,21 +3,67 @@
 #include <libavutil/avutil.h>
 #include <libswscale/swscale.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <string.h>
 
 // 声明SaveFrame函数
-void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame);
+void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir);
 
 int main(int argc, char *argv[])
 {
-    // 在新版本的FFmpeg中，av_register_all()已被弃用
-    printf("FFmpeg版本: %s\n", av_version_info());
 /**
  * ! 打开文件
  */
-    AVFormatContext *pFormatCtx;
-    // 打开video文件
-    if(avformat_open_input(&pFormatCtx, argv[1], NULL, NULL) != 0){
-        printf("无法打开视频文件\n");
+    // 在新版本的FFmpeg中，av_register_all()已被弃用
+    printf("FFmpeg版本: %s\n", av_version_info());
+
+    // 检查命令行参数
+    if (argc != 3) {
+        printf("用法: %s <视频文件路径> <输出文件夹>\n", argv[0]);
+        return -1;
+    }
+
+    const char *input_file = argv[1];
+    const char *output_dir = argv[2];
+
+    // 检查并创建输出目录
+    struct stat st = {0};
+    if (stat(output_dir, &st) == -1) {
+        #ifdef _WIN32
+            if (mkdir(output_dir) != 0) {
+        #else
+            if (mkdir(output_dir, 0700) != 0) {
+        #endif
+                printf("错误：无法创建输出目录 '%s'\n", output_dir);
+                return -1;
+            }
+    }
+
+    // 检查文件是否存在并且可读
+    FILE *file = fopen(input_file, "rb");
+    if (!file) {
+        printf("错误：文件 '%s' 不存在或无法访问\n", input_file);
+        return -1;
+    }
+    fclose(file);
+
+    // 初始化格式上下文
+    printf("正在打开文件: %s\n", input_file);
+    
+    // 创建格式上下文
+    AVFormatContext *pFormatCtx = avformat_alloc_context();
+    if (!pFormatCtx) {
+        printf("无法分配格式上下文\n");
+        return -1;
+    }
+
+    // 打开输入文件
+    int ret = avformat_open_input(&pFormatCtx, input_file, NULL, NULL);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+        printf("无法打开文件: %s (错误码: %d)\n", errbuf, ret);
+        avformat_free_context(pFormatCtx);
         return -1;
     }
     // 检查文件流信息
@@ -26,7 +72,7 @@ int main(int argc, char *argv[])
         return -1;
     }
     // 手工调试函数
-    av_dump_format(pFormatCtx, 0, argv[1], 0);
+    av_dump_format(pFormatCtx, 0, input_file, 0);
 
     int i;
     int videoStream=-1;
@@ -146,8 +192,8 @@ int main(int argc, char *argv[])
             sws_freeContext(sws_ctx);
 
             // 保存帧
-            if(i++ <= 5){
-                SaveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, i);
+            if(i++ <= 5) {
+                SaveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, i, output_dir);
             }
         }
         // 释放资源
@@ -171,17 +217,24 @@ int main(int argc, char *argv[])
 }
 
 // 把RGB信息定稿到PPM格式的文件
-void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
+void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir)
 {
     FILE *pFile;
-    char szFilename[32];
+    char szFilename[512];  // 增加缓冲区大小以适应路径
     int  y;
 
-    // Open file
-    sprintf(szFilename, "frame%d.ppm", iFrame);
-    pFile=fopen(szFilename, "wb");
-    if(pFile==NULL)
+    // 构建完整的文件路径
+    #ifdef _WIN32
+        snprintf(szFilename, sizeof(szFilename), "%s\\frame%d.ppm", outdir, iFrame);
+    #else
+        snprintf(szFilename, sizeof(szFilename), "%s/frame%d.ppm", outdir, iFrame);
+    #endif
+
+    pFile = fopen(szFilename, "wb");
+    if(pFile == NULL) {
+        printf("错误：无法创建文件 '%s'\n", szFilename);
         return;
+    }
 
     // Write header
     fprintf(pFile, "P6\n%d %d\n255\n", width, height);
@@ -193,4 +246,5 @@ void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
 
     // Close file
     fclose(pFile);
+    printf("已保存帧 %d 到 %s\n", iFrame, szFilename);
 }
