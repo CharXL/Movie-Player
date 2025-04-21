@@ -1,13 +1,18 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_thread.h>
 
-// 声明SaveFrame函数
-void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir);
+// SDL 全局变量
+SDL_Window *window = NULL;
+SDL_Renderer *renderer = NULL;
+SDL_Texture *texture = NULL;
 
 int main(int argc, char *argv[])
 {
@@ -114,44 +119,71 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-/**
- * ! 保存数据
- */
-    AVFrame *pFrame;
-    AVFrame *pFrameRGB;
     // 分配视频帧
-    pFrame = av_frame_alloc();
+    AVFrame *pFrame = av_frame_alloc();
     if(pFrame == NULL){
         printf("无法分配帧内存\n");
         return -1;
     }
 
-    // 申请RGB帧内存
-    pFrameRGB = av_frame_alloc();
-    if(pFrameRGB == NULL){
-        printf("无法分配内存\n");
+/**
+ * ! 初始化SDL2
+ */
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
+        printf("无法初始化SDL: %s\n", SDL_GetError());
         return -1;
     }
 
-    uint8_t *buffer;
-    int numBytes;
-    // 手工申请内存空间
-    numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height, 1);
-    buffer = (uint8_t *)av_malloc(numBytes * sizeof(uint8_t));
+/**
+ * ! 创建SDL2窗口和渲染器
+ */
+    window = SDL_CreateWindow(
+        "Video Player",
+        SDL_WINDOWPOS_UNDEFINED,
+        SDL_WINDOWPOS_UNDEFINED,
+        pCodecCtx->width,
+        pCodecCtx->height,
+        SDL_WINDOW_SHOWN
+    );
+    if (!window) {
+        printf("无法创建窗口: %s\n", SDL_GetError());
+        return -1;
+    }
 
-    // 帧和内存组合
-    av_image_fill_arrays(pFrameRGB->data, pFrameRGB->linesize, buffer, AV_PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height, 1);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        printf("无法创建渲染器: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        return -1;
+    }
+
+    texture = SDL_CreateTexture(
+        renderer,
+        SDL_PIXELFORMAT_IYUV,
+        SDL_TEXTUREACCESS_STREAMING,
+        pCodecCtx->width,
+        pCodecCtx->height
+    );
+    if (!texture) {
+        printf("无法创建纹理: %s\n", SDL_GetError());
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        return -1;
+    }
 
 /**
  * ! 读取数据
  */
     int frameFinished;
     AVPacket packet;
+    av_init_packet(&packet);
+
+    SDL_Event event;
+    int quit = 0;
 
     i = 0;
-    while(av_read_frame(pFormatCtx, &packet) >= 0){
-        // 是视频流
-        if(packet.stream_index == videoStream){
+    while (av_read_frame(pFormatCtx, &packet) >= 0 && !quit) {
+        if (packet.stream_index == videoStream) {
             // 解码视频帧
             int ret = avcodec_send_packet(pCodecCtx, &packet);
             if (ret < 0) {
@@ -161,83 +193,82 @@ int main(int argc, char *argv[])
 
             ret = avcodec_receive_frame(pCodecCtx, pFrame);
             if (ret < 0) {
-                // 需要更多数据包或者出错
                 continue;
             }
 
-            // 创建转换上下文
-            struct SwsContext *sws_ctx = sws_getContext(
-                pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt,
-                pCodecCtx->width, pCodecCtx->height, AV_PIX_FMT_RGB24,
-                SWS_BILINEAR, NULL, NULL, NULL
+            // 更新纹理
+            SDL_UpdateYUVTexture(texture, NULL,
+                pFrame->data[0], pFrame->linesize[0],    // Y
+                pFrame->data[1], pFrame->linesize[1],    // U
+                pFrame->data[2], pFrame->linesize[2]     // V
             );
 
-            if (!sws_ctx) {
-                printf("无法创建转换上下文\n");
-                continue;
-            }
+            // 渲染
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
 
-            // 转换像素格式
-            sws_scale(sws_ctx, (const uint8_t * const*)pFrame->data, pFrame->linesize, 0,
-                      pCodecCtx->height, pFrameRGB->data, pFrameRGB->linesize);
+            // 控制帧率
+            SDL_Delay(40);  // 约25fps
+        }
 
-            // 释放转换上下文
-            sws_freeContext(sws_ctx);
-
-            // 保存帧
-            if(i++ <= 5) {
-                SaveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, i, output_dir);
+        // 处理SDL事件
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                quit = 1;
+                break;
             }
         }
-        // 释放资源
+
         av_packet_unref(&packet);
     }
 
-    // 清理RGB图像
-    av_free(buffer);
-    av_frame_free(&pFrameRGB);
+/**
+ * ! 清理资源
+ */
+    // 清理SDL资源
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
 
-    // 清理YUV帧
+    // 清理FFmpeg资源
     av_frame_free(&pFrame);
-
-    // 关闭解码器
     avcodec_free_context(&pCodecCtx);
-
-    // 关闭文件
     avformat_close_input(&pFormatCtx);
 
     return 0;
 }
 
-// 把RGB信息定稿到PPM格式的文件
-void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir)
-{
-    FILE *pFile;
-    char szFilename[512];  // 增加缓冲区大小以适应路径
-    int  y;
-
-    // 构建完整的文件路径
-    #ifdef _WIN32
-        snprintf(szFilename, sizeof(szFilename), "%s\\frame%d.ppm", outdir, iFrame);
-    #else
-        snprintf(szFilename, sizeof(szFilename), "%s/frame%d.ppm", outdir, iFrame);
-    #endif
-
-    pFile = fopen(szFilename, "wb");
-    if(pFile == NULL) {
-        printf("错误：无法创建文件 '%s'\n", szFilename);
+/**
+ * ! SDL输出到屏幕
+ */
+void sdl_player(AVCodecContext *pCodecCtx, AVFrame *pFrame, AVPacket packet) {
+    if (!texture || !renderer) {
         return;
     }
 
-    // Write header
-    fprintf(pFile, "P6\n%d %d\n255\n", width, height);
+    // 更新纹理
+    SDL_UpdateYUVTexture(texture, NULL,
+        pFrame->data[0], pFrame->linesize[0],    // Y
+        pFrame->data[1], pFrame->linesize[1],    // U
+        pFrame->data[2], pFrame->linesize[2]     // V
+    );
 
-    // 一次向文件写入一行数据
-    // PPM格式：包含一长串RGB数据的文件
-    for(y=0; y<height; y++)
-        fwrite(pFrame->data[0]+y*pFrame->linesize[0], 1, width*3, pFile);
+    // 渲染到屏幕
+    SDL_RenderClear(renderer);
+    SDL_RenderCopy(renderer, texture, NULL, NULL);
+    SDL_RenderPresent(renderer);
 
-    // Close file
-    fclose(pFile);
-    printf("已保存帧 %d 到 %s\n", iFrame, szFilename);
+    // 事件处理
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        if (event.type == SDL_QUIT) {
+            SDL_DestroyTexture(texture);
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            exit(0);
+        }
+    }
 }

@@ -5,9 +5,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_thread.h>
 
-// 声明SaveFrame函数
-void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir);
 
 int main(int argc, char *argv[])
 {
@@ -147,11 +147,11 @@ int main(int argc, char *argv[])
  */
     int frameFinished;
     AVPacket packet;
+    av_init_packet(&packet);  // 在新版本中这一行可以省略，因为 av_read_frame 会初始化 packet
 
     i = 0;
-    while(av_read_frame(pFormatCtx, &packet) >= 0){
-        // 是视频流
-        if(packet.stream_index == videoStream){
+    while (av_read_frame(pFormatCtx, &packet) >= 0) {
+        if (packet.stream_index == videoStream) {
             // 解码视频帧
             int ret = avcodec_send_packet(pCodecCtx, &packet);
             if (ret < 0) {
@@ -184,13 +184,13 @@ int main(int argc, char *argv[])
             // 释放转换上下文
             sws_freeContext(sws_ctx);
 
-            // 保存帧
+            // 显示帧
             if(i++ <= 5) {
-                SaveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, i, output_dir);
+                sdl_player(pCodecCtx, pFrame, packet);
             }
         }
         // 释放资源
-        av_packet_unref(&packet);
+        av_packet_unref(&packet);  // 新版本使用 av_packet_unref 替代 av_free_packet
     }
 
     // 清理RGB图像
@@ -209,35 +209,86 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-// 把RGB信息定稿到PPM格式的文件
-void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir)
-{
-    FILE *pFile;
-    char szFilename[512];  // 增加缓冲区大小以适应路径
-    int  y;
+/**
+ * ! SDL输出到屏幕
+ */
 
-    // 构建完整的文件路径
-    #ifdef _WIN32
-        snprintf(szFilename, sizeof(szFilename), "%s\\frame%d.ppm", outdir, iFrame);
-    #else
-        snprintf(szFilename, sizeof(szFilename), "%s/frame%d.ppm", outdir, iFrame);
-    #endif
 
-    pFile = fopen(szFilename, "wb");
-    if(pFile == NULL) {
-        printf("错误：无法创建文件 '%s'\n", szFilename);
-        return;
+void sdl_player(AVCodecContext *pCodecCtx, AVFrame *pFrame, AVPacket packet){
+    // 初始化SDL
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
+        fprintf(stderr, "无法初始化SDL - %s\n", SDL_GetError());
+        return -1;
     }
 
-    // Write header
-    fprintf(pFile, "P6\n%d %d\n255\n", width, height);
+/**
+ * ! 创建窗口
+ */
+    SDL_Surface *screen;
+    screen = SDL_SetVideoMode(pCodecCtx->width, pCodecCtx->height, 0, 0);
 
-    // 一次向文件写入一行数据
-    // PPM格式：包含一长串RGB数据的文件
-    for(y=0; y<height; y++)
-        fwrite(pFrame->data[0]+y*pFrame->linesize[0], 1, width*3, pFile);
+    if(!screen){
+        fprintf(stderr, "SDL: 无法设置视频模式 - %s\n", SDL_GetError());
+        return -1;
+    }
+    
+    // 建立YUV覆盖用于输出视频
+    SDL_Texture *bmp;
+    bmp = SDL_CreateYUVOverlay(pCodecCtx->width, pCodecCtx->height, SDL_PIXELFORMAT_YV12, screen);
 
-    // Close file
-    fclose(pFile);
-    printf("已保存帧 %d 到 %s\n", iFrame, szFilename);
+/**
+ * ! 显示图像
+ */
+    AVFrame pict;
+    if(pFrame->width > 0 && pFrame->height > 0){
+        uint8_t *pixels;
+        int pitch;
+        SDL_LockTexture(bmp, NULL, &pixels, &pitch);
+
+        // YUV420P：三组通道，三种数据
+        pict.data[0] = pixels;
+        pict.data[1] = pixels + pCodecCtx->width * pCodecCtx->height;
+        pict.data[2] = pict.data[1] + (pCodecCtx->width * pCodecCtx->height) / 4;
+
+        pict.linesize[0] = pitch;
+        pict.linesize[1] = pitch / 2;
+        pict.linesize[2] = pitch / 2;
+
+        // 转换像素格式
+        img_convert(&pict, AV_PIX_FMT_YUV420P, (AVPicture *)pFrame, pCodecCtx->pix_fmt, pCodecCtx->width, pCodecCtx->height);
+
+        SDL_UnlockTexture(bmp);
+    }
+
+/**
+ * ! 绘制图像
+ */
+    SDL_Rect rect;
+    if(pFrame->width > 0 && pFrame->height > 0){
+        // 转换image为YUV格式提供给SDL使用
+        img_convert(&pict, pCodecCtx->pix_fmt, bmp, AV_PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height);
+        
+        SDL_UnlockTexture(bmp);
+
+        rect.x = 0;
+        rect.y = 0;
+        rect.w = pCodecCtx->width;
+        rect.h = pCodecCtx->height;
+
+        SDL_DisplayYUVOverlay(bmp, &rect);
+    }
+
+    // 事件驱动：处理SDL_QUIT事件用于退出
+    SDL_Event event;
+
+    av_free_packet(&packet);
+    SDL_PollEvent(&event);
+
+    switch(event.type){
+        case SDL_QUIT:
+            SDL_Quit();
+            break;
+        default:
+            break;
+    }
 }
