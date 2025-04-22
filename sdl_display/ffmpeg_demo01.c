@@ -14,6 +14,8 @@ SDL_Window *window = NULL;
 SDL_Renderer *renderer = NULL;
 SDL_Texture *texture = NULL;
 
+int sdl_player(AVCodecContext *pCodecCtx, AVFrame *pFrame, AVFormatContext *pFormatCtx, int videoStream);
+
 int main(int argc, char *argv[])
 {
 /**
@@ -82,10 +84,10 @@ int main(int argc, char *argv[])
             videoStream=i;
             break;
         }
-        if(videoStream == -1){
-            printf("无法找到视频流\n");
-            return -1;
-        }
+    }
+    if(videoStream == -1){  // 循环结束后再检查
+        printf("无法找到视频流\n");
+        return -1;
     }
     // 获得视频流的编解码器参数
     AVCodecParameters *pCodecPar = pFormatCtx->streams[videoStream]->codecpar;
@@ -126,6 +128,28 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    if(sdl_player(pCodecCtx, pFrame, pFormatCtx, videoStream) < 0){
+        printf("SDL播放器运行失败\n");
+        return -1;
+    }
+
+/**
+ * ! 清理资源
+ */
+
+    // 清理FFmpeg资源
+    av_frame_free(&pFrame);
+    avcodec_free_context(&pCodecCtx);
+    avformat_close_input(&pFormatCtx);
+
+    return 0;
+}
+
+/**
+ * ! SDL输出到屏幕
+ */
+int sdl_player(AVCodecContext *pCodecCtx, AVFrame *pFrame, AVFormatContext *pFormatCtx, int videoStream) {
+    
 /**
  * ! 初始化SDL2
  */
@@ -135,8 +159,8 @@ int main(int argc, char *argv[])
     }
 
 /**
- * ! 创建SDL2窗口和渲染器
- */
+* ! 创建SDL2窗口和渲染器
+*/
     window = SDL_CreateWindow(
         "Video Player",
         SDL_WINDOWPOS_UNDEFINED,
@@ -172,16 +196,14 @@ int main(int argc, char *argv[])
     }
 
 /**
- * ! 读取数据
- */
-    int frameFinished;
+* ! 读取数据
+*/
     AVPacket packet;
     av_init_packet(&packet);
 
     SDL_Event event;
     int quit = 0;
 
-    i = 0;
     while (av_read_frame(pFormatCtx, &packet) >= 0 && !quit) {
         if (packet.stream_index == videoStream) {
             // 解码视频帧
@@ -223,52 +245,11 @@ int main(int argc, char *argv[])
         av_packet_unref(&packet);
     }
 
-/**
- * ! 清理资源
- */
     // 清理SDL资源
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
 
-    // 清理FFmpeg资源
-    av_frame_free(&pFrame);
-    avcodec_free_context(&pCodecCtx);
-    avformat_close_input(&pFormatCtx);
-
     return 0;
-}
-
-/**
- * ! SDL输出到屏幕
- */
-void sdl_player(AVCodecContext *pCodecCtx, AVFrame *pFrame, AVPacket packet) {
-    if (!texture || !renderer) {
-        return;
-    }
-
-    // 更新纹理
-    SDL_UpdateYUVTexture(texture, NULL,
-        pFrame->data[0], pFrame->linesize[0],    // Y
-        pFrame->data[1], pFrame->linesize[1],    // U
-        pFrame->data[2], pFrame->linesize[2]     // V
-    );
-
-    // 渲染到屏幕
-    SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, NULL, NULL);
-    SDL_RenderPresent(renderer);
-
-    // 事件处理
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        if (event.type == SDL_QUIT) {
-            SDL_DestroyTexture(texture);
-            SDL_DestroyRenderer(renderer);
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            exit(0);
-        }
-    }
 }
