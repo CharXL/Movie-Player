@@ -13,6 +13,37 @@
 #include <SDL2/SDL_audio.h>
 #include <SDL2/SDL_video.h>
 
+// 定义常量
+#define VIDEO_PICTURE_QUEUE_SIZE 10
+#define MAX_AUDIOQ_SIZE (5 * 16 * 1024)
+#define MAX_VIDEOQ_SIZE (5 * 256 * 1024)
+#define PIX_FMT_YUV420P AV_PIX_FMT_YUV420P
+
+// 自定义事件类型
+#define FF_REFRESH_EVENT (SDL_USEREVENT + 1)
+#define FF_QUIT_EVENT (SDL_USEREVENT + 2)
+#define FF_ALLOC_EVENT (SDL_USEREVENT + 3)
+
+// 前向声明
+typedef struct VideoState VideoState;
+
+// 图像队列结构体
+typedef struct VideoPicture {
+    SDL_Texture *texture;  // 替换SDL_Overlay为SDL_Texture
+    int width, height;
+    int allocated;
+} VideoPicture;
+
+// 包队列结构体
+typedef struct PacketQueue {
+    AVPacketList *first_pkt, *last_pkt;
+    int nb_packets;
+    int size;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+    int quit;  // 添加quit字段
+} PacketQueue;
+
 // 音频回调结构体
 typedef struct AudioState {
     AVFormatContext *format_ctx;
@@ -26,8 +57,9 @@ typedef struct AudioState {
     SDL_AudioSpec wanted_spec;  // SDL音频参数
     int audio_stream_idx;       // 添加音频流索引
 } AudioState;
+
 // 视频结构体
-typedef struct VideoState {
+struct VideoState {
     AVFormatContext *pFormatCtx;
     int videoStream, audioStream;
     AVStream *audio_st;
@@ -48,89 +80,399 @@ typedef struct VideoState {
     SDL_Thread *video_tid;
     char filename[1024];
     int quit;
-} VideoState;
-// 图像队列结构体
-typedef struct VideoPicture {
-    SDL_Overlay *bmp;
-    int width, height;
-    int allocated;
-} VideoPicture;
+    
+    // SDL2相关
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+    SDL_Rect screen_rect;
+    SDL_TimerID refresh_timer;
+};
 
-// 声明函数
+// 函数前向声明
+static Uint32 sdl_refresh_timer_cb(Uint32 interval, void *opaque);
+static void schedule_refresh(VideoState *is, int delay);
 void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame, const char *outdir);
 int init_audio(AudioState *audio);
 void audio_callback(void *userdata, Uint8 *stream, int len);
 int audio_decode_frame(AudioState *audio);
+int decode_thread(void *arg);
+int video_thread(void *arg);
+static int queue_picture(VideoState *is, AVFrame *pFrame);
+void packet_queue_init(PacketQueue *q);
+int packet_queue_put(PacketQueue *q, AVPacket *pkt);
+int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block);
+static void alloc_picture(void *userdata);
+static void video_refresh_timer(void *userdata);
+void packet_queue_quit(PacketQueue *q);
 
 // 声明变量
 VideoState *global_video_state;
+SDL_Window *screen;
 
 int main(int argc, char *argv[])
 {
-    SDL_Event event;
     VideoState *is;
+    AVPacket packet;
+    
+    // 初始化FFmpeg
+    av_register_all();
+    avformat_network_init();
+    
+    printf("FFmpeg initialized\n");
+    
     is = (VideoState *)av_mallocz(sizeof(VideoState));
-
-    pstrcpy(is->filename, sizeof(is->filename), argv[1]);
+    if (!is) {
+        fprintf(stderr, "Could not allocate VideoState\n");
+        return -1;
+    }
+    
+    // 安全处理命令行参数
+    if (argc < 2) {
+        // 使用默认文件路径
+        strncpy(is->filename, "input.mp4", sizeof(is->filename) - 1);
+        fprintf(stderr, "No input file specified, using default: %s\n", is->filename);
+    } else {
+        strncpy(is->filename, argv[1], sizeof(is->filename) - 1);
+    }
+    is->filename[sizeof(is->filename) - 1] = '\0';
 
     is->pictq_mutex = SDL_CreateMutex();
     is->pictq_cond = SDL_CreateCond();
 
-/**
- * ! 第一个线程
- */
-    schedule_refresh(is, 40);
-
-    is->parse_tid = SDL_CreateThread(decode_thread, "decode_thread", is);
-    if (!is->parse_tid) {
-        av_free(is);
+    // 初始化SDL2
+    if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
+        fprintf(stderr, "Could not initialize SDL - %s\n", SDL_GetError());
         return -1;
     }
 
-    for(;;){
-        if(is->quit){
-            break;
+    // 创建窗口
+    is->window = SDL_CreateWindow("FFmpeg Player",
+                                SDL_WINDOWPOS_UNDEFINED,
+                                SDL_WINDOWPOS_UNDEFINED,
+                                640, 480,
+                                SDL_WINDOW_SHOWN);
+    if(!is->window) {
+        fprintf(stderr, "SDL: could not create window - exiting\n");
+        return -1;
+    }
+
+    // 创建渲染器
+    is->renderer = SDL_CreateRenderer(is->window, -1, SDL_RENDERER_ACCELERATED);
+    if(!is->renderer) {
+        fprintf(stderr, "SDL: could not create renderer - exiting\n");
+        return -1;
+    }
+
+    // 设置渲染器背景色(黑色)
+    SDL_SetRenderDrawColor(is->renderer, 0, 0, 0, 255);
+    SDL_RenderClear(is->renderer);
+    SDL_RenderPresent(is->renderer);
+
+    // 获取窗口尺寸
+    SDL_GetWindowSize(is->window, &is->screen_rect.w, &is->screen_rect.h);
+    
+    // 初始化队列
+    packet_queue_init(&is->videoq);
+    packet_queue_init(&is->audioq);
+    
+    is->videoStream = -1;
+    is->audioStream = -1;
+    is->pictq_size = 0;
+    is->pictq_rindex = 0;
+    is->pictq_windex = 0;
+    is->quit = 0; // 确保初始化为0
+    
+    global_video_state = is;
+    
+    // 设置第一次刷新
+    schedule_refresh(is, 40);
+    
+    is->parse_tid = SDL_CreateThread(decode_thread, "decode_thread", is);
+    if (!is->parse_tid) {
+        fprintf(stderr, "Could not create decode thread\n");
+        av_free(is);
+        return -1;
+    }
+  
+    // 等待解码线程完成初始化
+    while (!is->pFormatCtx && !is->quit) {
+        SDL_Delay(10);
+    }
+    
+    if (is->quit) {
+        fprintf(stderr, "Decode thread failed to initialize\n");
+        return -1;
+    }
+    
+    // 添加事件处理循环
+    while (!is->quit) {
+        SDL_Event event;
+        
+        // 使用超时来避免无限等待
+        if (SDL_WaitEventTimeout(&event, 100)) {
+            switch (event.type) {
+                case FF_REFRESH_EVENT:
+                    video_refresh_timer(event.user.data1);
+                    break;
+                case SDL_KEYDOWN:
+                    if (event.key.keysym.sym == SDLK_ESCAPE || 
+                        event.key.keysym.sym == SDLK_q) {
+                        is->quit = 1;
+                    }
+                    break;
+                case SDL_QUIT:
+                    is->quit = 1;
+                    break;
+                case FF_QUIT_EVENT:
+                    is->quit = 1;
+                    break;
+                case FF_ALLOC_EVENT:
+                    alloc_picture(event.user.data1);
+                    break;
+                default:
+                    break;
+            }
         }
-        // 进行seek操作
-        if(is->audio.size > MAX_AUDIOQ_SIZE || is->videoq.size > MAX_VIDEOQ_SIZE){
+        
+        // 添加手动检查退出条件
+        if (SDL_GetKeyboardState(NULL)[SDL_SCANCODE_ESCAPE] || 
+            SDL_GetKeyboardState(NULL)[SDL_SCANCODE_Q]) {
+            fprintf(stderr, "Quit requested via keyboard check\n");
+            is->quit = 1;
+        }
+    }  
+    
+    fprintf(stderr, "Exiting event loop, cleaning up...\n");
+    
+    // 设置队列退出标志
+    packet_queue_quit(&is->audioq);
+    packet_queue_quit(&is->videoq);
+    
+    // 通过SDL事件机制通知子线程退出
+    SDL_Event event;
+    event.type = FF_QUIT_EVENT;
+    event.user.data1 = is;
+    SDL_PushEvent(&event);
+    
+    // 清理资源
+    if (is->parse_tid) {
+        SDL_WaitThread(is->parse_tid, NULL);
+    }
+    
+    if (is->video_tid) {
+        SDL_WaitThread(is->video_tid, NULL);
+    }
+    
+    // 销毁队列
+    if (is->pictq_mutex) {
+        SDL_DestroyMutex(is->pictq_mutex);
+    }
+    
+    if (is->pictq_cond) {
+        SDL_DestroyCond(is->pictq_cond);
+    }
+    
+    // 销毁视频资源
+    for (int i = 0; i < VIDEO_PICTURE_QUEUE_SIZE; i++) {
+        if (is->pictq[i].texture) {
+            SDL_DestroyTexture(is->pictq[i].texture);
+        }
+    }
+    
+    // 销毁SDL资源
+    if (is->renderer) {
+        SDL_DestroyRenderer(is->renderer);
+    }
+    
+    if (is->window) {
+        SDL_DestroyWindow(is->window);
+    }
+    
+    SDL_Quit();
+    
+    // 释放VideoState
+    if (is) {
+        if (is->pFormatCtx) {
+            avformat_close_input(&is->pFormatCtx);
+        }
+        av_free(is);
+    }
+    
+    return 0;
+}
+
+// 解码线程函数
+int decode_thread(void *arg) {
+    VideoState *is = (VideoState *)arg;
+    
+    // 打开输入文件
+    if(avformat_open_input(&is->pFormatCtx, is->filename, NULL, NULL) != 0) {
+        fprintf(stderr, "Could not open file %s\n", is->filename);
+        is->quit = 1;
+        return -1;
+    }
+    
+    // 获取流信息
+    if(avformat_find_stream_info(is->pFormatCtx, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information\n");
+        is->quit = 1;
+        return -1;
+    }
+    
+    // 输出视频信息
+    av_dump_format(is->pFormatCtx, 0, is->filename, 0);
+    
+    // 初始化视频和音频流索引
+    is->videoStream = -1;
+    is->audioStream = -1;
+    
+    // 查找视频流和音频流
+    for(unsigned int i = 0; i < is->pFormatCtx->nb_streams; i++) {
+        if(is->pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && 
+           is->videoStream < 0) {
+            is->videoStream = i;
+        }
+        if(is->pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && 
+           is->audioStream < 0) {
+            is->audioStream = i;
+        }
+    }
+    
+    // 打开视频流
+    if(is->videoStream >= 0) {
+        if (stream_component_open(is, is->videoStream) < 0) {
+            fprintf(stderr, "Could not open video stream\n");
+            is->videoStream = -1;
+        } else {
+            // 创建视频线程
+            is->video_tid = SDL_CreateThread(video_thread, "video_thread", is);
+            if (!is->video_tid) {
+                fprintf(stderr, "Could not create video thread\n");
+                is->quit = 1;
+                return -1;
+            }
+        }
+    }
+    
+    // 打开音频流
+    if(is->audioStream >= 0) {
+        if (stream_component_open(is, is->audioStream) < 0) {
+            fprintf(stderr, "Could not open audio stream\n");
+            is->audioStream = -1;
+        }
+    }
+    
+    if(is->videoStream < 0 && is->audioStream < 0) {
+        fprintf(stderr, "Could not open any streams\n");
+        is->quit = 1;
+        return -1;
+    }
+    
+    // 开始读取包
+    AVPacket packet;
+    while(!is->quit) {
+        if(is->audioq.size > MAX_AUDIOQ_SIZE || is->videoq.size > MAX_VIDEOQ_SIZE) {
             SDL_Delay(10);
             continue;
         }
-        if(av_read_frame(is->pFormatCtx, packet) < 0){
-            if(url_feof(is->pFormatCtx->pb) == 0){
+        
+        if(av_read_frame(is->pFormatCtx, &packet) < 0) {
+            if(avio_feof(is->pFormatCtx->pb) == 0) {
                 SDL_Delay(100);
                 continue;
-            }
-            else{
+            } else {
                 break;
             }
         }
-        // packet来自video
-        if(packet->stream_index == is->videoStream){
-            packet_queue_put(&is->videoq, packet);
-        }
-        else if(packet->stream_index == is->audioStream){
-            packet_queue_put(&is->audioq, packet);
-        }
-        else{
-            av_free_packet(packet);
+        
+        // 分发包到相应队列
+        if(packet.stream_index == is->videoStream) {
+            packet_queue_put(&is->videoq, &packet);
+        } else if(packet.stream_index == is->audioStream) {
+            packet_queue_put(&is->audioq, &packet);
+        } else {
+            av_packet_unref(&packet);
         }
     }
-
-    while(is->quit){
-        SDL_Delay(100);
-    }
-
-    fail:
-    if(1){
-        SDL_Event event;
-        event.type = FF_QUIT_EVENT;
-        event.user.data1 = is;
-        SDL_PushEvent(&event);
-    }
-
+    
     return 0;
+}
 
+// 包队列初始化
+void packet_queue_init(PacketQueue *q) {
+    memset(q, 0, sizeof(PacketQueue));
+    q->mutex = SDL_CreateMutex();
+    q->cond = SDL_CreateCond();
+    q->quit = 0; // 初始化为0
+}
+
+// 包队列放入
+int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
+    AVPacketList *pkt_list;
+    
+    pkt_list = av_malloc(sizeof(AVPacketList));
+    if(!pkt_list)
+        return -1;
+    pkt_list->pkt = *pkt;
+    pkt_list->next = NULL;
+    
+    SDL_LockMutex(q->mutex);
+    
+    if(!q->last_pkt)
+        q->first_pkt = pkt_list;
+    else
+        q->last_pkt->next = pkt_list;
+    q->last_pkt = pkt_list;
+    q->nb_packets++;
+    q->size += pkt_list->pkt.size;
+    SDL_CondSignal(q->cond);
+    
+    SDL_UnlockMutex(q->mutex);
+    return 0;
+}
+
+// 包队列取出
+int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block) {
+    AVPacketList *pkt_list;
+    int ret;
+    
+    SDL_LockMutex(q->mutex);
+    
+    for(;;) {
+        if(q->quit) {
+            ret = -1;
+            break;
+        }
+        
+        pkt_list = q->first_pkt;
+        if(pkt_list) {
+            q->first_pkt = pkt_list->next;
+            if(!q->first_pkt)
+                q->last_pkt = NULL;
+            q->nb_packets--;
+            q->size -= pkt_list->pkt.size;
+            *pkt = pkt_list->pkt;
+            av_free(pkt_list);
+            ret = 1;
+            break;
+        } else if(!block) {
+            ret = 0;
+            break;
+        } else {
+            SDL_CondWaitTimeout(q->cond, q->mutex, 100); // 添加超时时间
+        }
+    }
+    SDL_UnlockMutex(q->mutex);
+    return ret;
+}
+
+// 添加一个函数来设置队列退出标志
+void packet_queue_quit(PacketQueue *q) {
+    SDL_LockMutex(q->mutex);
+    q->quit = 1;
+    SDL_CondSignal(q->cond);
+    SDL_UnlockMutex(q->mutex);
 }
 
 // 初始化音频
@@ -279,8 +621,16 @@ int stream_component_open(VideoState *is, int stream_index) {
     if(stream_index < 0 || stream_index >= pFormatCtx->nb_streams){
         return -1;
     }
-    // 获取解码器上下文
-    codecCtx = pFormatCtx->streams[stream_index]->codec;
+    // 使用codecpar替代codec
+    codecCtx = avcodec_alloc_context3(NULL);
+    if (!codecCtx) {
+        return -1;
+    }
+    if (avcodec_parameters_to_context(codecCtx, pFormatCtx->streams[stream_index]->codecpar) < 0) {
+        avcodec_free_context(&codecCtx);
+        return -1;
+    }
+
     if(codecCtx->codec_type == AVMEDIA_TYPE_AUDIO){
         // 从编解码信息设置音频设置
         wanted_spec.freq = codecCtx->sample_rate;
@@ -293,8 +643,9 @@ int stream_component_open(VideoState *is, int stream_index) {
         }
     }
     codec = avcodec_find_decoder(codecCtx->codec_id);
-    if(!codec || avcodec_open(codecCtx, codec) < 0){
+    if(!codec || avcodec_open2(codecCtx, codec, NULL) < 0){
         fprintf(stderr, "Unsupported codec!\n");
+        avcodec_free_context(&codecCtx);
         return -1;
     }
 
@@ -322,129 +673,171 @@ int stream_component_open(VideoState *is, int stream_index) {
     return 0;
 }
 
-/**
- * ! 得到帧
- */
-int video_thread(void *arg){
+// 修改video_thread函数
+int video_thread(void *arg) {
     VideoState *is = (VideoState *)arg;
     AVPacket pkt1, *packet = &pkt1;
-    int len1, frameFinished;
     AVFrame *pFrame;
-
+    AVCodecContext *codecCtx;
+    
     pFrame = av_frame_alloc();
-
-    for(;;){
-        if(packet_queue_get(&is->videoq, packet, 1) < 0){
-            // 退出
-            break;
-        }
-        // 解码视频帧
-        len1 = avcodec_decode_video2(is->video_st->codec, pFrame, &frameFinished, packet);
-
-        // 是否取到视频帧
-        if(frameFinished){
-            if(queue_picture(is, pFrame) < 0){
-                break;
-            }
-        }
-        av_free_packet(packet);
+    if (!pFrame) {
+        fprintf(stderr, "Could not allocate video frame\n");
+        return -1;
     }
-    av_free(pFrame);
-    return 0;
-}
-
-/**
- * ! 把帧队列化
- */
-int queue_picture(VideoState *is, AVFrame *pFrame){
-    VideoPicture *vp;
-    int dst_pix_fmt;
-    AVPicture pict;
-
-    // 等待空闲的图像队列
-    SDL_LockMutex(is->pictq_mutex);
-    while(is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE && !is->quit){
-        SDL_CondWait(is->pictq_cond, is->pictq_mutex);
+    
+    // 获取解码器上下文
+    codecCtx = avcodec_alloc_context3(NULL);
+    if (!codecCtx) {
+        fprintf(stderr, "Could not allocate codec context\n");
+        return -1;
     }
-    SDL_UnlockMutex(is->pictq_mutex);
-
-    if(is->quit){
+    
+    if (avcodec_parameters_to_context(codecCtx, is->video_st->codecpar) < 0) {
+        fprintf(stderr, "Could not copy codec parameters\n");
+        return -1;
+    }
+    
+    AVCodec *codec = avcodec_find_decoder(codecCtx->codec_id);
+    if (!codec) {
+        fprintf(stderr, "Unsupported codec\n");
+        return -1;
+    }
+    
+    if (avcodec_open2(codecCtx, codec, NULL) < 0) {
+        fprintf(stderr, "Could not open codec\n");
         return -1;
     }
 
-    // 分配图像内存
-    vp = &is->pictq[is->pictq_windex];
-    if(!vp->bmp || vp->width != is->video_st->codec->width || vp->height != is->video_st->codec->height){
-        SDL_Event event;
-
-        vp->allocated = 0;
-        event.type = FF_ALLOC_EVENT;
-        event.user.data1 = is;
-        SDL_PushEvent(&event);
-
-        // 等待SDL分配图像内存
-        SDL_LockMutex(is->pictq_mutex);
-        while(!vp->allocated && !is->quit){
-            SDL_CondWait(is->pictq_cond, is->pictq_mutex);
+    for(;;) {
+        if(is->quit) {
+            break;
         }
-        SDL_UnlockMutex(is->pictq_mutex);
+        
+        if(packet_queue_get(&is->videoq, packet, 1) < 0) {
+            break;
+        }
+        
+        // 发送包到解码器
+        int ret = avcodec_send_packet(codecCtx, packet);
+        if (ret < 0) {
+            fprintf(stderr, "Error sending packet for decoding\n");
+            av_packet_unref(packet);
+            continue;
+        }
+        
+        // 接收解码后的帧
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(codecCtx, pFrame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            } else if (ret < 0) {
+                fprintf(stderr, "Error during decoding\n");
+                break;
+            }
+            
+            if(queue_picture(is, pFrame) < 0) {
+                break;
+            }
+        }
+        
+        av_packet_unref(packet);
+    }
+    
+    avcodec_free_context(&codecCtx);
+    av_frame_free(&pFrame);
+    return 0;
+}
 
-        if(is->quit){
+// 修改queue_picture函数
+int queue_picture(VideoState *is, AVFrame *pFrame) {
+    VideoPicture *vp;
+    
+    // 等待空闲的图像队列
+    SDL_LockMutex(is->pictq_mutex);
+    while(is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE && !is->quit) {
+        SDL_CondWait(is->pictq_cond, is->pictq_mutex);
+    }
+    SDL_UnlockMutex(is->pictq_mutex);
+    
+    if(is->quit) {
+        return -1;
+    }
+    
+    // 获取写入位置
+    vp = &is->pictq[is->pictq_windex];
+    
+    // 检查是否需要分配或重新分配纹理
+    if(!vp->texture || vp->width != is->video_st->codecpar->width || 
+       vp->height != is->video_st->codecpar->height) {
+        
+        // 已经有纹理，销毁它
+        if(vp->texture) {
+            SDL_DestroyTexture(vp->texture);
+            vp->texture = NULL;
+        }
+        
+        // 创建新纹理
+        vp->texture = SDL_CreateTexture(
+            is->renderer,
+            SDL_PIXELFORMAT_IYUV,
+            SDL_TEXTUREACCESS_STREAMING,
+            is->video_st->codecpar->width,
+            is->video_st->codecpar->height
+        );
+        
+        if (!vp->texture) {
+            fprintf(stderr, "SDL: could not create texture - %s\n", SDL_GetError());
             return -1;
         }
+        
+        vp->width = is->video_st->codecpar->width;
+        vp->height = is->video_st->codecpar->height;
+        vp->allocated = 1;
     }
-    if(vp->bmp){
-        // 转换像素格式
-        SDL_LockYUVOverlay(vp->bmp, 0);
     
-        dst_pix_fmt = PIX_FMT_YUV420P;
-        pict.data[0] = vp->bmp->pixels[0];
-        pict.data[1] = vp->bmp->pixels[2];
-        pict.data[2] = vp->bmp->pixels[1];
-        pict.linesize[0] = vp->bmp->pitches[0];
-        pict.linesize[1] = vp->bmp->pitches[2];
-        pict.linesize[2] = vp->bmp->pitches[1];
-
-        // 将图像转为SDL使用的YUV格式
-        img_convert(&pict, dst_pix_fmt, (AVPicture *)pFrame, is->video_st->codec->pix_fmt, is->video_st->codec->width, is->video_st->codec->height);
-
-        SDL_UnlockYUVOverlay(vp->bmp, 0);
+    // 更新纹理
+    if(vp->texture) {
+        // 更新YUV平面
+        SDL_UpdateYUVTexture(vp->texture, NULL,
+                           pFrame->data[0], pFrame->linesize[0],
+                           pFrame->data[1], pFrame->linesize[1],
+                           pFrame->data[2], pFrame->linesize[2]);
+        
         // 更新队列
-        if(++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE){
+        if(++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
             is->pictq_windex = 0;
         }
+        
         SDL_LockMutex(is->pictq_mutex);
         is->pictq_size++;
         SDL_UnlockMutex(is->pictq_mutex);
     }
+    
     return 0;
 }
 
-void alloc_picture(void *userdata, VideoPicture *vp){
+void alloc_picture(void *userdata) {
     VideoState *is = (VideoState *)userdata;
     VideoPicture *vp;
 
     vp = &is->pictq[is->pictq_windex];
-    if(vp->bmp){
-        // 释放旧的图像
-        SDL_FreeYUVOverlay(vp->bmp);
+    if(vp->texture){
+        SDL_DestroyTexture(vp->texture);
     }
 
-    // 为图像分配内存
-    vp->bmp = SDL_CreateYUVOverlay(
-        is->video_st->codec->width,
-        is->video_st->codec->height,
-        SDL_YV12_OVERLAY,
-        screen
-    );
-    vp->width = is->video_st->codec->width;
-    vp->height = is->video_st->codec->height;
+    vp->texture = SDL_CreateTexture(is->renderer,
+                                  SDL_PIXELFORMAT_IYUV,
+                                  SDL_TEXTUREACCESS_STREAMING,
+                                  is->video_st->codecpar->width,
+                                  is->video_st->codecpar->height);
+    
+    vp->width = is->video_st->codecpar->width;
+    vp->height = is->video_st->codecpar->height;
     vp->allocated = 1;
 
     // 通知视频线程图像已分配
     SDL_LockMutex(is->pictq_mutex);
-
-    vp->allocated = 1;
     SDL_CondSignal(is->pictq_cond);
     SDL_UnlockMutex(is->pictq_mutex);
 }
@@ -453,7 +846,17 @@ void alloc_picture(void *userdata, VideoPicture *vp){
  * ! 显示视频
  */
 static void schedule_refresh(VideoState *is, int delay) {
-    SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
+    SDL_Event event;
+    event.type = FF_REFRESH_EVENT;
+    event.user.data1 = is;
+    
+    SDL_RemoveTimer(is->refresh_timer);
+    is->refresh_timer = SDL_AddTimer(delay, sdl_refresh_timer_cb, is);
+    
+    // 如果定时器创建失败，直接推送事件
+    if (!is->refresh_timer) {
+        SDL_PushEvent(&event);
+    }
 }
 
 static Uint32 sdl_refresh_timer_cb(Uint32 interval, void *opaque) {
@@ -467,73 +870,78 @@ static Uint32 sdl_refresh_timer_cb(Uint32 interval, void *opaque) {
 void video_refresh_timer(void *userdata) {
     VideoState *is = (VideoState *)userdata;
     VideoPicture *vp;
-    if(is->video_st){
-        if(is->pictq_size == 0){
+    
+    if(is->video_st) {
+        if(is->pictq_size == 0) {
             schedule_refresh(is, 1);
-        }
-        else{
+        } else {
             vp = &is->pictq[is->pictq_rindex];
-
-            // 计算延迟
-            schedule_refresh(is, 80);
-
+            
             // 显示图像
-            SDL_LockYUVOverlay(vp->bmp, 0);
-            SDL_DisplayYUVOverlay(vp->bmp, &is->screen_rect);
-            SDL_UnlockYUVOverlay(vp->bmp, 0);
-
+            SDL_RenderClear(is->renderer);
+            SDL_RenderCopy(is->renderer, vp->texture, NULL, &is->screen_rect);
+            SDL_RenderPresent(is->renderer);
+            
+            // 计算下一帧延迟
+            schedule_refresh(is, 40);
+            
             // 更新队列
-            if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE){
+            if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
                 is->pictq_rindex = 0;
             }
+            
             SDL_LockMutex(is->pictq_mutex);
             is->pictq_size--;
             SDL_CondSignal(is->pictq_cond);
             SDL_UnlockMutex(is->pictq_mutex);
         }
-    }
-    else{
+    } else {
         schedule_refresh(is, 100);
     }
 }
+
 // 显示视频
 void video_display(VideoState *is) {
     SDL_Rect rect;
     VideoPicture *vp;
-    AVPicture pict;
     float aspect_ratio;
     int w, h, x, y;
-    int i;
 
     vp = &is->pictq[is->pictq_rindex];
-    if(vp->bmp){
-        if(is->video_st->codec->sample_aspect_ratio.num == 0){
+    if(vp->texture){
+        if(is->video_st->codecpar->sample_aspect_ratio.num == 0){
             aspect_ratio = 0;
         }
         else{
-            aspect_ratio = av_q2d(is->video_st->codec->sample_aspect_ratio) * is->video_st->codec->width / is->video_st->codec->height;
+            aspect_ratio = av_q2d(is->video_st->codecpar->sample_aspect_ratio) * 
+                          is->video_st->codecpar->width / is->video_st->codecpar->height;
         }
 
         if(aspect_ratio <= 0.0){
-            aspect_ratio = (float)is->video_st->codec->width / (float)is->video_st->codec->height;
+            aspect_ratio = (float)is->video_st->codecpar->width / 
+                          (float)is->video_st->codecpar->height;
         }
 
-        h = screen->h;
+        h = is->screen_rect.h;
         w = ((int)rint(h * aspect_ratio)) & -3;
-        if(w > screen->w){
-            w = screen->w;
+        if(w > is->screen_rect.w){
+            w = is->screen_rect.w;
             h = ((int)rint(w / aspect_ratio)) & -3;
         }
-        x = (screen->w - w) / 2;
-        y = (screen->h - h) / 2;
+        x = (is->screen_rect.w - w) / 2;
+        y = (is->screen_rect.h - h) / 2;
 
         rect.x = x;
         rect.y = y;
         rect.w = w;
         rect.h = h;
-        SDL_DisplayYUVOverlay(vp->bmp, &rect);
+        
+        SDL_RenderClear(is->renderer);
+        SDL_RenderCopy(is->renderer, vp->texture, NULL, &rect);
+        SDL_RenderPresent(is->renderer);
     }
-}   
+}
+
 int decode_interrupt_cb(void *ctx) {
     return (global_video_state && global_video_state->quit);
 }
